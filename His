@@ -1,1 +1,518 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+<title>Kamera + NN (ulepszona: lepsze cechy, augmentacje, tło, progi per-klasa, EMA)</title>
+
+<!-- TensorFlow.js + MobileNet -->
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.18.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/mobilenet@2.1.0"></script>
+
+<style>
+  :root { --pad:12px; --radius:12px; }
+  body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#0d1117;color:#e6edf3}
+  header{padding:16px;text-align:center;background:#161b22;position:sticky;top:0;z-index:10;border-bottom:1px solid #30363d}
+  main{padding:16px;display:grid;gap:16px}
+  .card{background:#161b22;border:1px solid #30363d;border-radius:var(--radius);padding:var(--pad)}
+  .grid{display:grid;gap:16px}
+  @media(min-width:960px){.grid{grid-template-columns:1.15fr 1fr}}
+  video,canvas{width:100%;border-radius:var(--radius);background:#0b0f14}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  button,select,input[type="text"],input[type="number"],input[type="range"],label.toggle{
+    background:#21262d;color:#e6edf3;border:1px solid #30363d;border-radius:10px;padding:10px 12px;font-size:15px}
+  button:hover{background:#2a3139;cursor:pointer}
+  input[type="text"]{flex:1;min-width:160px}
+  .pill{display:flex;align-items:center;gap:8px;padding:6px 10px;border-radius:999px;background:#21262d;border:1px solid #30363d;margin:4px 4px 0 0;font-size:14px}
+  .pill b{color:#8b949e}.ok{color:#7ee787}.warn{color:#f0883e}.err{color:#ff7b72}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  .big{font-size:22px;font-weight:700;letter-spacing:.2px}
+  progress{width:100%;height:10px;accent-color:#7ee787}
+  .footnote{color:#8b949e;font-size:13px}
+  table{width:100%;border-collapse:collapse}
+  th,td{border:1px solid #30363d;padding:6px 8px;text-align:left}
+</style>
+</head>
+<body>
+<header>
+  <div class="big">👁️ Kamera + Prosta Sieć NN (ulepszona)</div>
+  <div class="footnote">Cechy: <b>global_average</b> (fallback: conv_preds) · Augmentacje · Klasa „tło” · Progi per-klasa · EMA wygładzanie</div>
+</header>
+
+<main class="grid">
+  <!-- LEWA: kamera + rozpoznawanie -->
+  <section class="card">
+    <h2>1) Kamera i rozpoznawanie</h2>
+    <div class="row">
+      <button id="btnCam">📷 Uruchom kamerę</button>
+      <select id="cameraSelect" title="Wybierz kamerę"></select>
+      <button id="btnFlip">🔄 Obróć podgląd</button>
+    </div>
+    <video id="video" autoplay playsinline muted></video>
+
+    <div class="row" style="margin-top:10px;">
+      <button id="btnStart" disabled>▶️ Start</button>
+      <button id="btnStop" disabled>⏸️ Stop</button>
+      <label class="toggle"><input type="checkbox" id="speakToggle" /> 🔊 Mów</label>
+      <label class="toggle" title="Wygładzanie EMA (0=brak, 0.9=wolne)"><span>EMA α</span>
+        <input type="range" id="emaAlpha" min="0" max="0.9" step="0.05" value="0.6" />
+        <span id="emaAlphaVal">0.60</span>
+      </label>
+      <label class="toggle" title="FPS predykcji"><span>FPS</span>
+        <input type="number" id="fps" min="2" max="30" value="10" />
+      </label>
+    </div>
+
+    <div class="card" style="margin-top:10px;">
+      <div><b>Aktualny wynik</b></div>
+      <div id="predLabel" class="big">—</div>
+      <div id="predInfo" class="mono">p=— | warstwa=— | dim=—</div>
+    </div>
+
+    <div class="card" style="margin-top:10px;">
+      <b>Progi per-klasa</b>
+      <div id="thresholdTableWrap" class="footnote">Dodaj klasy po prawej — tu pojawi się tabelka progów.</div>
+    </div>
+  </section>
+
+  <!-- PRAWA: uczenie (klasy, augmentacje, trening) -->
+  <section class="card">
+    <h2>2) Uczenie własnych klas</h2>
+    <div class="row">
+      <input id="className" type="text" placeholder="np. jabłko, stół..." />
+      <button id="btnAddClass">➕ Dodaj klasę</button>
+      <button id="btnAddBG">🌫️ Dodaj klasę „tło”</button>
+    </div>
+
+    <div class="row">
+      <label class="toggle" title="Flip poziomy w augmentacji">
+        <input type="checkbox" id="augFlip" checked /> Flip
+      </label>
+      <label class="toggle" title="Losowa rotacja ±deg">
+        Rotacja ± <input type="number" id="augRot" value="10" min="0" max="45" style="width:64px" />°
+      </label>
+      <label class="toggle" title="Zoom losowy (1.0 = brak)">
+        Zoom [1.0–] <input type="number" id="augZoom" value="1.15" step="0.05" min="1.0" max="2.0" style="width:72px" />
+      </label>
+      <label class="toggle" title="Jasność ±">
+        Jasność ± <input type="number" id="augBright" value="0.08" step="0.02" min="0" max="0.5" style="width:72px" />
+      </label>
+      <label class="toggle" title="Kontrast ±">
+        Kontrast ± <input type="number" id="augContr" value="0.15" step="0.05" min="0" max="0.7" style="width:72px" />
+      </label>
+    </div>
+
+    <div id="classList" style="margin-top:10px;"></div>
+
+    <div class="card" style="margin-top:10px;">
+      <div class="row">
+        <button id="btnTrain" disabled>🧠 Trenuj</button>
+        <button id="btnClear" disabled>🗑️ Wyczyść</button>
+      </div>
+      <div style="margin-top:10px;">
+        Epoki: <input type="number" id="epochs" min="1" max="100" value="25" />
+        Batch: <input type="number" id="batch" min="4" max="64" value="16" />
+        Aug. kopii / próbkę: <input type="number" id="augPerSample" min="0" max="5" value="2" />
+      </div>
+      <div style="margin-top:10px;">
+        <progress id="trainProgress" value="0" max="1"></progress>
+        <div id="trainInfo" class="mono">—</div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:10px;">
+      <div class="row">
+        <button id="btnSaveModel" disabled>💾 Zapisz model</button>
+        <input type="file" id="loadModelFiles" accept=".json,.bin" multiple />
+      </div>
+      <div class="footnote">
+        Zapis: <span class="mono">model.json</span> + <span class="mono">weights.bin</span> (lokalnie).
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- Ukryte canvasy (kadr i augmentacje) -->
+<canvas id="base224" width="224" height="224" style="display:none;"></canvas>
+<canvas id="aug224" width="224" height="224" style="display:none;"></canvas>
+
+<script>
+/* ======= USTAWIENIA / STAN ======= */
+let video=null, baseC=null, baseCtx=null, augC=null, augCtx=null, currentStream=null;
+let mobileNet=null, embeddingEndpoint='global_average', embeddingDim=0;
+let classifier=null;           // mała sieć Dense
+const classes=[];              // {name, samples: Tensor1D[]}
+let thresholds={};             // nazwa_klasy -> próg (0..1)
+let emaAlpha=0.6;              // wygładzanie
+let emaProbs=null;             // Float32Array dla C klas (aktualizowane online)
+let isMirrored=true, isRunning=false, canSpeak=false;
+let lastSpoken={label:"", ts:0};
+
+const ui = {
+  btnCam: q('#btnCam'), cameraSelect: q('#cameraSelect'), btnFlip: q('#btnFlip'),
+  btnStart: q('#btnStart'), btnStop: q('#btnStop'),
+  speakToggle: q('#speakToggle'), fps: q('#fps'),
+  emaAlpha: q('#emaAlpha'), emaAlphaVal: q('#emaAlphaVal'),
+  predLabel: q('#predLabel'), predInfo: q('#predInfo'),
+  thresholdTableWrap: q('#thresholdTableWrap'),
+
+  className: q('#className'), btnAddClass: q('#btnAddClass'), btnAddBG: q('#btnAddBG'),
+  classList: q('#classList'),
+  augFlip: q('#augFlip'), augRot: q('#augRot'), augZoom: q('#augZoom'), augBright: q('#augBright'), augContr: q('#augContr'),
+
+  btnTrain: q('#btnTrain'), btnClear: q('#btnClear'),
+  epochs: q('#epochs'), batch: q('#batch'), augPerSample: q('#augPerSample'),
+  trainProgress: q('#trainProgress'), trainInfo: q('#trainInfo'),
+
+  btnSaveModel: q('#btnSaveModel'), loadModelFiles: q('#loadModelFiles'),
+};
+
+function q(sel){ return document.querySelector(sel); }
+
+/* ======= Kamera ======= */
+async function listCameras(){
+  const dev = await navigator.mediaDevices.enumerateDevices();
+  const cams = dev.filter(d=>d.kind==='videoinput');
+  ui.cameraSelect.innerHTML='';
+  cams.forEach((d,i)=>{
+    const opt=document.createElement('option');
+    opt.value=d.deviceId; opt.textContent=d.label||`Kamera ${i+1}`;
+    ui.cameraSelect.appendChild(opt);
+  });
+}
+async function startCamera(deviceId){
+  if(currentStream){ currentStream.getTracks().forEach(t=>t.stop()); currentStream=null; }
+  const constraints = {
+    audio:false,
+    video:{
+      deviceId: deviceId?{exact:deviceId}:undefined,
+      facingMode: deviceId?undefined:'environment',
+      width:{ideal:1280}, height:{ideal:720}
+    }
+  };
+  currentStream = await navigator.mediaDevices.getUserMedia(constraints);
+  video.srcObject=currentStream; await video.play();
+}
+
+/* ======= MobileNet: cechy ======= */
+async function loadBackends(){
+  try{ await tf.setBackend('webgpu'); await tf.ready(); }
+  catch(e){ try{ await tf.setBackend('webgl'); await tf.ready(); } catch(_){} }
+}
+async function loadMobileNet(){
+  ui.trainInfo.textContent='Ładowanie MobileNet…';
+  mobileNet = await mobilenet.load({version:2, alpha:1.0});
+  ui.trainInfo.textContent='MobileNet gotowy.';
+}
+function drawToBase224(){
+  const size=224, vw=video.videoWidth, vh=video.videoHeight;
+  if(!vw||!vh) return false;
+  // crop do kwadratu (letterbox cut)
+  let sx=0,sy=0,sw=vw,sh=vh;
+  if(vw>vh){ sw=vh; sx=Math.floor((vw-sw)/2); }
+  else { sh=vw; sy=Math.floor((vh-sh)/2); }
+  baseCtx.save(); baseCtx.clearRect(0,0,size,size);
+  if(isMirrored){ baseCtx.translate(size,0); baseCtx.scale(-1,1); }
+  baseCtx.drawImage(video,sx,sy,sw,sh,0,0,size,size);
+  baseCtx.restore();
+  return true;
+}
+
+/* ======= Augmentacje (canvas + tf) ======= */
+function randomRange(min,max){ return min + Math.random()*(max-min); }
+function drawAugmentFromBase(){
+  // Canvas affine: rotacja, zoom, opcjonalny flip
+  const size=224;
+  augCtx.save();
+  augCtx.clearRect(0,0,size,size);
+  augCtx.translate(size/2,size/2);
+
+  // losowy flip poziomy
+  if(ui.augFlip.checked && Math.random()<0.5){ augCtx.scale(-1,1); }
+
+  // losowa rotacja
+  const rotDeg = clamp(parseFloat(ui.augRot.value||'0'),0,45);
+  const rot = randomRange(-rotDeg, rotDeg) * Math.PI/180;
+  augCtx.rotate(rot);
+
+  // losowy zoom (>=1.0)
+  const zoomMax = Math.max(1.0, parseFloat(ui.augZoom.value||'1.0'));
+  const zoom = randomRange(1.0, zoomMax);
+  augCtx.scale(zoom, zoom);
+
+  // rysuj z base224 w środek
+  augCtx.drawImage(baseC, -size/2, -size/2, size, size);
+  augCtx.restore();
+}
+function tensorFromAugCanvasWithBC(){
+  // pobierz tensor i zastosuj jasność/kontrast w TF
+  const brightAmp = clamp(parseFloat(ui.augBright.value||'0'),0,0.5);  // ±
+  const contrAmp  = clamp(parseFloat(ui.augContr.value||'0'),0,0.7);   // ±
+  return tf.tidy(()=>{
+    let img = tf.browser.fromPixels(augC).toFloat().div(255); // [H,W,3], 0..1
+    if(brightAmp>0){
+      const delta = randomRange(-brightAmp, brightAmp);
+      img = tf.image.adjustBrightness(img, delta);
+    }
+    if(contrAmp>0){
+      const factor = 1.0 + randomRange(-contrAmp, contrAmp);
+      img = tf.image.adjustContrast(img, factor);
+    }
+    img = img.clipByValue(0,1);
+    return img.expandDims(0); // [1,224,224,3]
+  });
+}
+
+/* ======= Embedding ======= */
+function getEmbeddingBatch(batchedImg){
+  // próbuj bogatszą warstwę 'global_average' (1024-D); fallback 'conv_preds' (1000-D)
+  try{
+    const e = mobileNet.infer(batchedImg, 'global_average'); // [1,1024]
+    embeddingEndpoint='global_average';
+    return e;
+  }catch(_){
+    const e = mobileNet.infer(batchedImg, 'conv_preds');     // [1,1000]
+    embeddingEndpoint='conv_preds';
+    return e;
+  }
+}
+
+/* ======= Klasy, próbkowanie ======= */
+function renderClassList(){
+  ui.classList.innerHTML='';
+  classes.forEach((c,idx)=>{
+    const pill = document.createElement('div'); pill.className='pill';
+    pill.innerHTML = `<b>${idx+1}.</b> ${c.name} — próbki: <span class="ok">${c.samples.length}</span>`;
+    const btn1=document.createElement('button'); btn1.textContent='📸 +1';
+    btn1.onclick=async()=>{ const t = await captureOneEmbedding(true); if(t){ c.samples.push(t); renderClassList(); } };
+    const btn10=document.createElement('button'); btn10.textContent='🎞️ +10';
+    btn10.onclick=async()=>{ await captureBurst(c,10); };
+    const btnDel=document.createElement('button'); btnDel.textContent='✖️ Usuń';
+    btnDel.onclick=()=>{ c.samples.forEach(t=>t.dispose()); classes.splice(idx,1); renderClassList(); refreshTrainButtons(); renderThresholdTable(); };
+    pill.append(btn1,btn10,btnDel);
+    ui.classList.appendChild(pill);
+  });
+  refreshTrainButtons(); renderThresholdTable();
+}
+async function captureOneEmbedding(withAug){
+  if(!drawToBase224()) return null;
+  if(withAug){ drawAugmentFromBase(); }
+  // jeśli bez augmentacji — skopiuj base do aug i weź tensor
+  if(!withAug){
+    augCtx.clearRect(0,0,224,224); augCtx.drawImage(baseC,0,0);
+  }
+  const emb = tf.tidy(()=>{
+    const img = tensorFromAugCanvasWithBC();                 // [1,224,224,3]
+    const e = getEmbeddingBatch(img);                        // [1,D]
+    const row = e.squeeze();                                 // [D]
+    img.dispose(); e.dispose();
+    return row;
+  });
+  embeddingDim = emb.shape[0];
+  return emb;
+}
+async function captureBurst(c, n=10){
+  let added=0;
+  await loopAsync(n, async()=>{
+    const t = await captureOneEmbedding(true);
+    if(t){ c.samples.push(t); added++; renderClassList(); }
+    await sleep(330);
+  });
+}
+function ensureBackgroundClass(){
+  if(classes.find(k=>k.name==='tło')) return;
+  const bg = {name:'tło', samples:[]};
+  classes.push(bg);
+  thresholds['tło'] = thresholds['tło'] ?? 0.8; // domyślnie wyżej
+}
+
+/* ======= Progi per-klasa ======= */
+function renderThresholdTable(){
+  if(classes.length===0){ ui.thresholdTableWrap.innerHTML='Dodaj klasy — pojawi się tabela progów.'; return; }
+  const table = document.createElement('table');
+  const thead = document.createElement('thead');
+  thead.innerHTML = `<tr><th>Klasa</th><th>Próg</th></tr>`;
+  table.appendChild(thead);
+  const tbody = document.createElement('tbody');
+  classes.forEach(c=>{
+    if(!(c.name in thresholds)) thresholds[c.name]=0.70;
+    const tr=document.createElement('tr');
+    const td1=document.createElement('td'); td1.textContent=c.name;
+    const td2=document.createElement('td');
+    const inp=document.createElement('input'); inp.type='number'; inp.min='0'; inp.max='0.99'; inp.step='0.01';
+    inp.value = thresholds[c.name].toFixed(2); inp.style.width='80px';
+    inp.onchange=()=>{ thresholds[c.name]=clamp(parseFloat(inp.value||'0.7'),0,0.99); };
+    td2.appendChild(inp); tr.append(td1,td2); tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  ui.thresholdTableWrap.innerHTML=''; ui.thresholdTableWrap.appendChild(table);
+}
+
+/* ======= Model klasyfikatora i trening ======= */
+function refreshTrainButtons(){
+  const total = classes.reduce((s,c)=>s+c.samples.length,0);
+  ui.btnTrain.disabled = !(classes.length>=2 && total>=classes.length*5);
+  ui.btnClear.disabled = total===0;
+  ui.btnStart.disabled = !(classifier && classes.length>=2);
+  ui.btnStop.disabled = !isRunning;
+  ui.btnSaveModel.disabled = !(classifier && classes.length>=1);
+}
+async function buildAndTrain(){
+  // Złóż X/y z augmentacją kopii
+  ui.trainInfo.textContent='Przygotowuję dane…';
+  const augCopies = clamp(parseInt(ui.augPerSample.value||'2',10),0,5);
+  const feats=[]; const labels=[];
+  for(let i=0;i<classes.length;i++){
+    for(const baseEmb of classes[i].samples){
+      feats.push(baseEmb.clone()); labels.push(i);
+      // dodatkowe kopie: lekki noise w embeddingu (opcjonalne) – albo zbieramy nowe z kamery; tu lekki jitter
+      for(let k=0;k<augCopies;k++){
+        const jitter = tf.tidy(()=> baseEmb.add(tf.randomNormal(baseEmb.shape,0,0.01)) );
+        feats.push(jitter); labels.push(i);
+      }
+    }
+  }
+  const X = tf.stack(feats); // [N,D]
+  feats.forEach(t=>t.dispose());
+  embeddingDim = X.shape[1];
+  const yIdx = tf.tensor1d(labels,'int32'); const y = tf.oneHot(yIdx, classes.length).toFloat(); yIdx.dispose();
+
+  if(classifier) classifier.dispose();
+  classifier = tf.sequential();
+  classifier.add(tf.layers.dense({inputShape:[embeddingDim], units:96, activation:'relu', kernelRegularizer:tf.regularizers.l2({l2:1e-4})}));
+  classifier.add(tf.layers.dropout({rate:0.35}));
+  classifier.add(tf.layers.dense({units:classes.length, activation:'softmax'}));
+  classifier.compile({optimizer: tf.train.adam(0.001), loss:'categoricalCrossentropy', metrics:['accuracy']});
+
+  const epochs = clamp(parseInt(ui.epochs.value||'25',10),1,100);
+  const batch  = clamp(parseInt(ui.batch.value||'16',10),4,64);
+  ui.trainProgress.value=0;
+  ui.trainInfo.textContent=`Trenuję… epoki=${epochs}, batch=${batch}, emb=${embeddingDim}`;
+
+  await classifier.fit(X,y,{
+    epochs, batchSize:batch, shuffle:true,
+    callbacks:{
+      onEpochEnd:(ep,logs)=>{
+        ui.trainProgress.value=(ep+1)/epochs;
+        ui.trainInfo.textContent=`Epoka ${ep+1}/${epochs} — loss=${logs.loss.toFixed(4)} acc=${(logs.acc||logs.accuracy||0).toFixed(3)}`;
+      }
+    }
+  });
+  X.dispose(); y.dispose();
+
+  emaProbs = null; // zresetuj wygładzanie dla nowej liczby klas
+  ui.trainInfo.textContent=`Gotowe ✔️ — warstwa=${embeddingEndpoint}, dim=${embeddingDim}`;
+  refreshTrainButtons(); renderThresholdTable();
+}
+
+/* ======= Predykcja + EMA + mowa ======= */
+function speak(text){
+  if(!canSpeak) return;
+  const now=Date.now(); if(text===lastSpoken.label && now-lastSpoken.ts<1500) return;
+  lastSpoken={label:text, ts:now};
+  const u=new SpeechSynthesisUtterance(text);
+  const v=window.speechSynthesis.getVoices().find(v=>v.lang && v.lang.toLowerCase().startsWith('pl'));
+  if(v) u.voice=v; u.rate=1; u.pitch=1; u.lang='pl-PL';
+  window.speechSynthesis.cancel(); window.speechSynthesis.speak(u);
+}
+async function predictOnce(){
+  if(!classifier) return;
+  if(!drawToBase224()) return;
+  // augmentacje wyłączone przy predykcji — bierz „czysty” kadr
+  augCtx.clearRect(0,0,224,224); augCtx.drawImage(baseC,0,0);
+  const {probs, dim, endpoint} = await tf.tidy(()=>{
+    const img = tf.browser.fromPixels(augC).toFloat().div(255).expandDims(0);
+    const e = getEmbeddingBatch(img); const row = e; // [1,D]
+    const logits = classifier.predict(row);             // [1,C]
+    const p = logits.squeeze();                         // [C]
+    const out = p.dataSync();                           // Float32Array
+    const dimNow = row.shape[1];
+    img.dispose(); e.dispose(); logits.dispose(); p.dispose();
+    return { probs: out, dim: dimNow, endpoint: embeddingEndpoint };
+  });
+
+  // EMA wygładzanie
+  if(!emaProbs || emaProbs.length!==probs.length) emaProbs=new Float32Array(probs.length);
+  for(let i=0;i<probs.length;i++){
+    emaProbs[i] = emaProbs[i]*(1-emaAlpha) + probs[i]*emaAlpha;
+  }
+
+  // argmax po EMA
+  let best=-1, bestP=0;
+  for(let i=0;i<emaProbs.length;i++){ if(emaProbs[i]>bestP){ bestP=emaProbs[i]; best=i; } }
+
+  const label = classes[best] ? classes[best].name : "—";
+  const thr = thresholds[label] ?? 0.70;
+
+  ui.predLabel.textContent = (bestP>=thr) ? label : "—";
+  ui.predInfo.textContent  = `p=${bestP.toFixed(3)} | próg(${label})=${(thr||0).toFixed(2)} | warstwa=${endpoint} | dim=${dim}`;
+
+  if(bestP>=thr && label!=="—"){ speak(label); }
+}
+async function predictLoop(){
+  const fps = clamp(parseInt(ui.fps.value||'10',10),2,30);
+  const interval = Math.max(33, Math.floor(1000/fps));
+  while(isRunning){
+    await predictOnce();
+    await sleep(interval);
+  }
+}
+
+/* ======= Zapisywanie / Wczytywanie ======= */
+async function saveModel(){ if(!classifier) return; await classifier.save('downloads://model'); }
+async function loadModelFromFiles(fileList){
+  const files = Array.from(fileList);
+  const handler = tf.io.browserFiles(files);
+  if(classifier) classifier.dispose();
+  classifier = await tf.loadLayersModel(handler);
+  ui.trainInfo.textContent="Model wczytany ✔️"; refreshTrainButtons();
+}
+
+/* ======= Narzędzia ======= */
+function clamp(x,min,max){ return isNaN(x)?min:Math.max(min,Math.min(max,x)); }
+function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+async function loopAsync(n,fn){ for(let i=0;i<n;i++){ await fn(i); } }
+
+/* ======= UI Zdarzenia ======= */
+async function init(){
+  await loadBackends();
+  video = q('#video'); baseC=q('#base224'); baseCtx=baseC.getContext('2d',{willReadFrequently:true});
+  augC=q('#aug224');   augCtx =augC.getContext('2d',{willReadFrequently:true});
+  try{ await loadMobileNet(); }catch(e){ console.error(e); ui.trainInfo.textContent='Błąd ładowania MobileNet.'; }
+  try{ await listCameras(); }catch(e){ console.warn('enumerateDevices może wymagać wcześniejszej zgody kamery.'); }
+}
+ui.btnCam.onclick = async ()=>{
+  try{ await startCamera(ui.cameraSelect.value||undefined); await listCameras(); ui.btnStart.disabled=!(classifier && classes.length>=2); }
+  catch(e){ alert("Nie mogę uruchomić kamery. Sprawdź uprawnienia/HTTPS."); console.error(e); }
+};
+ui.cameraSelect.onchange = async ()=>{ await startCamera(ui.cameraSelect.value); };
+ui.btnFlip.onclick = ()=>{ isMirrored = !isMirrored; };
+
+ui.speakToggle.onchange = ()=>{
+  canSpeak = ui.speakToggle.checked;
+  if(canSpeak){ const u=new SpeechSynthesisUtterance(""); window.speechSynthesis.speak(u); }
+};
+ui.emaAlpha.oninput = ()=>{ emaAlpha = parseFloat(ui.emaAlpha.value||'0.6'); ui.emaAlphaVal.textContent = emaAlpha.toFixed(2); };
+
+ui.btnStart.onclick = ()=>{ if(!classifier) return; isRunning=true; ui.btnStart.disabled=true; ui.btnStop.disabled=false; predictLoop(); };
+ui.btnStop.onclick = ()=>{ isRunning=false; refreshTrainButtons(); };
+
+ui.btnAddClass.onclick = ()=>{ const name=(ui.className.value||'').trim(); if(!name){ alert('Podaj nazwę klasy.'); return; } classes.push({name, samples:[]}); thresholds[name]=thresholds[name]??0.70; ui.className.value=''; renderClassList(); };
+ui.btnAddBG.onclick = ()=>{ ensureBackgroundClass(); renderClassList(); };
+
+ui.btnTrain.onclick = async ()=>{ try{ await buildAndTrain(); }catch(e){ ui.trainInfo.textContent='Błąd trenowania (konsola).'; console.error(e); } };
+ui.btnClear.onclick = ()=>{
+  classes.forEach(c=>c.samples.forEach(t=>t.dispose()));
+  classes.length=0; thresholds={}; if(classifier){ classifier.dispose(); classifier=null; }
+  emaProbs=null; ui.trainProgress.value=0; ui.trainInfo.textContent='Wyczyszczono.'; ui.predLabel.textContent='—'; ui.predInfo.textContent='—';
+  renderClassList(); renderThresholdTable(); refreshTrainButtons();
+};
+
+ui.btnSaveModel.onclick = ()=>saveModel();
+ui.loadModelFiles.onchange = async (e)=>{ try{ await loadModelFromFiles(e.target.files); }catch(er){ alert('Nie udało się wczytać modelu.'); console.error(er);} };
+
+init();
+</script>
+</body>
+</html>
 
